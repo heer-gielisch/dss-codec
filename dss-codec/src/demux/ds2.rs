@@ -27,13 +27,26 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
     }
 
     if format_type >= 6 {
-        // QP mode: continuous bitstream (no byte-swap)
+        // QP mode: continuous bitstream (no byte-swap).
+        // Empty blocks (frame_count=0) contain only a partial frame continuation;
+        // the remaining payload bytes are garbage and must be discarded.
+        // Valid continuation bytes = max(0, byte1*2 - 6), same formula as DSS empty blocks.
         let mut stream = Vec::new();
         for bi in 0..num_blocks {
             let bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE;
-            stream.extend_from_slice(
-                &data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE],
-            );
+            let fc = data[bstart + 2];
+            let b1 = data[bstart + 1] as usize;
+            if fc == 0 {
+                let cont_size = (b1 * 2).saturating_sub(DS2_BLOCK_HEADER_SIZE);
+                stream.extend_from_slice(
+                    &data[bstart + DS2_BLOCK_HEADER_SIZE
+                        ..bstart + DS2_BLOCK_HEADER_SIZE + cont_size],
+                );
+            } else {
+                stream.extend_from_slice(
+                    &data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE],
+                );
+            }
         }
         Ok(DemuxedDs2::Qp {
             stream,
