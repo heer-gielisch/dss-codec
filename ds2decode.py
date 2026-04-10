@@ -208,11 +208,20 @@ def read_ds2_file(path):
         total_frames += data[DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE + 2]
 
     if format_type >= 6:
-        # QP mode: continuous bitstream (no byte-swap)
+        # QP mode: continuous bitstream (no byte-swap).
+        # Empty blocks (frame_count=0) contain only continuation bytes; the rest
+        # is garbage that must be discarded. Valid bytes = max(0, byte1*2 - 6),
+        # the same formula as DSS empty blocks (with swap=0).
         stream = bytearray()
         for bi in range(num_blocks):
             bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
-            stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
+            fc = data[bstart + 2]
+            b1 = data[bstart + 1]
+            if fc == 0:
+                cont_size = max(0, b1 * 2 - 6)
+                stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_HEADER_SIZE + cont_size])
+            else:
+                stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
         return bytes(stream), total_frames, 'qp'
     else:
         # SP mode: byte-swap demuxing
