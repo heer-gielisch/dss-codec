@@ -111,27 +111,34 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
 /// For SP files the `mode` parameter is ignored — SP has no annotation
 /// metadata and all frames are always returned.
 pub fn demux_ds2_ex(data: &[u8], mode: ExtractionMode) -> Result<DemuxedDs2> {
-    // Bug fix: check bytes 1-3 for "ds2" and byte 0 for version (0x01 or 0x03)
-    // separately, instead of comparing all 4 bytes as a literal, which can fail
-    // silently when the escape sequence is mis-encoded in the source file.
-    if data.len() < DS2_HEADER_SIZE + DS2_BLOCK_SIZE
+    // Bug fix: check bytes 1-3 for "ds2" and byte 0 for version (0x01, 0x03, or
+    // 0x07) separately, instead of comparing all 4 bytes as a literal, which can
+    // fail silently when the escape sequence is mis-encoded in the source file.
+    if data.len() < 4
         || &data[1..4] != b"ds2"
-        || (data[0] != 0x01 && data[0] != 0x03)
+        || (data[0] != 0x01 && data[0] != 0x03 && data[0] != 0x07)
     {
         return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
     }
 
-    let num_blocks = (data.len() - DS2_HEADER_SIZE) / DS2_BLOCK_SIZE;
+    // The 0x07 variant uses a 0x1000-byte file header; all others use 0x600.
+    let header_size = if data[0] == 0x07 { 0x1000usize } else { DS2_HEADER_SIZE };
+
+    if data.len() < header_size + DS2_BLOCK_SIZE {
+        return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
+    }
+
+    let num_blocks = (data.len() - header_size) / DS2_BLOCK_SIZE;
     if num_blocks == 0 {
         return Err(DecodeError::NoAudioData);
     }
 
-    let format_type = data[DS2_HEADER_SIZE + 4];
+    let format_type = data[header_size + 4];
 
     if format_type >= 6 {
-        demux_qp(data, num_blocks, mode)
+        demux_qp(data, num_blocks, header_size, mode)
     } else {
-        demux_sp(data, num_blocks)
+        demux_sp(data, num_blocks, header_size)
     }
 }
 
@@ -182,12 +189,12 @@ fn is_annotation(abs_frame: usize, annotations: &[AnnRange]) -> bool {
 
 // ── QP demuxer ────────────────────────────────────────────────────────────────
 
-fn demux_qp(data: &[u8], num_blocks: usize, mode: ExtractionMode) -> Result<DemuxedDs2> {
+fn demux_qp(data: &[u8], num_blocks: usize, header_size: usize, mode: ExtractionMode) -> Result<DemuxedDs2> {
     // ── Step 1: build the linear raw payload buffer ───────────────────────────
     let mut raw: Vec<u8> = Vec::with_capacity(num_blocks * DS2_BLOCK_PAYLOAD_SIZE);
     let mut total_frames_in_file: usize = 0;
     for bi in 0..num_blocks {
-        let bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE;
+        let bstart = header_size + bi * DS2_BLOCK_SIZE;
         total_frames_in_file += data[bstart + 2] as usize;
         raw.extend_from_slice(
             &data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE],
@@ -198,7 +205,7 @@ fn demux_qp(data: &[u8], num_blocks: usize, mode: ExtractionMode) -> Result<Demu
     // may extend a few bytes beyond the raw buffer.  Pad with zeros so the
     // bitstream reader never reads out of bounds.  The padding produces silent
     // audio for the last partial frame rather than garbage or a panic.
-    let first_cont = data[DS2_HEADER_SIZE + 1] as usize * 2;
+    let first_cont = data[header_size + 1] as usize * 2;
     let first_payload_off = first_cont.saturating_sub(DS2_BLOCK_HEADER_SIZE);
     let min_raw_len = first_payload_off + total_frames_in_file * QP_FRAME_BYTES;
     if raw.len() < min_raw_len {
@@ -231,7 +238,7 @@ fn demux_qp(data: &[u8], num_blocks: usize, mode: ExtractionMode) -> Result<Demu
     let mut abs_frames_done: usize = 0;
 
     for bi in 0..num_blocks {
-        let bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE;
+        let bstart = header_size + bi * DS2_BLOCK_SIZE;
         let cont_bytes = data[bstart + 1] as usize * 2;
         let frame_count = data[bstart + 2] as usize;
 
@@ -338,19 +345,19 @@ fn demux_qp(data: &[u8], num_blocks: usize, mode: ExtractionMode) -> Result<Demu
 
 // ── SP demuxer (unchanged) ────────────────────────────────────────────────────
 
-fn demux_sp(data: &[u8], num_blocks: usize) -> Result<DemuxedDs2> {
+fn demux_sp(data: &[u8], num_blocks: usize, header_size: usize) -> Result<DemuxedDs2> {
     let mut raw: Vec<u8> = Vec::with_capacity(num_blocks * DS2_BLOCK_PAYLOAD_SIZE);
     let mut total_frames: usize = 0;
 
     for bi in 0..num_blocks {
-        let bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE;
+        let bstart = header_size + bi * DS2_BLOCK_SIZE;
         total_frames += data[bstart + 2] as usize;
         raw.extend_from_slice(
             &data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE],
         );
     }
 
-    let mut swap = ((data[DS2_HEADER_SIZE] >> 7) & 1) as usize;
+    let mut swap = ((data[header_size] >> 7) & 1) as usize;
     let mut swap_byte: u8 = 0;
     let mut pos: usize = 0;
     let mut frame_packets: Vec<Vec<u8>> = Vec::with_capacity(total_frames);

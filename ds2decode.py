@@ -196,17 +196,20 @@ def read_ds2_file(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    if data[:4] not in (b'\x03ds2', b'\x01ds2'):
+    if data[:4] not in (b'\x03ds2', b'\x01ds2', b'\x07ds2'):
         raise ValueError(f"Not a DS2 file: {path}")
 
-    num_blocks = (len(data) - DS2_HEADER_SIZE) // DS2_BLOCK_SIZE
+    # \x07ds2 variant uses a larger 0x1000-byte header; others use 0x600
+    header_size = 0x1000 if data[0] == 0x07 else DS2_HEADER_SIZE
+
+    num_blocks = (len(data) - header_size) // DS2_BLOCK_SIZE
 
     # Detect format from first block header byte 4
-    format_type = data[DS2_HEADER_SIZE + 4]
+    format_type = data[header_size + 4]
 
     total_frames = 0
     for bi in range(num_blocks):
-        total_frames += data[DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE + 2]
+        total_frames += data[header_size + bi * DS2_BLOCK_SIZE + 2]
 
     if format_type >= 6:
         # QP mode: segmented bitstream with cut-point detection.
@@ -227,7 +230,7 @@ def read_ds2_file(path):
 
         raw = bytearray()
         for bi in range(num_blocks):
-            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
+            bstart = header_size + bi * DS2_BLOCK_SIZE
             raw.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
 
         segments = []
@@ -237,7 +240,7 @@ def read_ds2_file(path):
         first_seg = True
 
         for bi in range(num_blocks):
-            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
+            bstart = header_size + bi * DS2_BLOCK_SIZE
             b1 = data[bstart + 1]
             fc = data[bstart + 2]
 
@@ -278,10 +281,10 @@ def read_ds2_file(path):
         # SP mode: byte-swap demuxing
         stream = bytearray()
         for bi in range(num_blocks):
-            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
+            bstart = header_size + bi * DS2_BLOCK_SIZE
             stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
 
-        swap = (data[DS2_HEADER_SIZE] >> 7) & 1
+        swap = (data[header_size] >> 7) & 1
         swap_byte = 0
         pos = 0
         frame_packets = []
