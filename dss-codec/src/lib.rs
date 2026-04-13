@@ -8,7 +8,7 @@ pub mod tables;
 use crate::codec::ds2_qp::Ds2QpDecoder;
 use crate::codec::ds2_sp::Ds2SpDecoder;
 use crate::codec::dss_sp::DssSpDecoder;
-use crate::demux::ds2::{demux_ds2, DemuxedDs2};
+use crate::demux::ds2::{demux_ds2_ex, DemuxedDs2, ExtractionMode};
 use crate::demux::dss::demux_dss;
 use crate::demux::{detect_format, AudioFormat};
 use crate::error::{DecodeError, Result};
@@ -27,20 +27,33 @@ pub struct AudioBuffer {
     pub format: AudioFormat,
 }
 
-/// Decode a DSS/DS2 file to an AudioBuffer.
+/// Decode a DSS/DS2 file to an AudioBuffer (all frames).
 pub fn decode_file(path: &Path) -> Result<AudioBuffer> {
     let data = std::fs::read(path)?;
     decode_to_buffer(&data)
 }
 
-/// Decode raw file bytes to an AudioBuffer.
+/// Decode a DSS/DS2 file, selecting which frames to include.
+///
+/// For DSS/DS2 SP files the `mode` parameter is ignored.
+pub fn decode_file_ex(path: &Path, mode: ExtractionMode) -> Result<AudioBuffer> {
+    let data = std::fs::read(path)?;
+    decode_to_buffer_ex(&data, mode)
+}
+
+/// Decode raw file bytes to an AudioBuffer (all frames).
 pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
+    decode_to_buffer_ex(data, ExtractionMode::All)
+}
+
+/// Decode raw file bytes with explicit extraction mode.
+pub fn decode_to_buffer_ex(data: &[u8], mode: ExtractionMode) -> Result<AudioBuffer> {
     let format = detect_format(data)
         .ok_or_else(|| DecodeError::UnsupportedFormat(data.first().copied().unwrap_or(0)))?;
     match format {
         AudioFormat::DssSp => decode_dss_sp(data),
         AudioFormat::Ds2Sp => decode_ds2_sp(data),
-        AudioFormat::Ds2Qp => decode_ds2_qp(data),
+        AudioFormat::Ds2Qp => decode_ds2_qp(data, mode),
     }
 }
 
@@ -60,7 +73,7 @@ fn decode_dss_sp(data: &[u8]) -> Result<AudioBuffer> {
 }
 
 fn decode_ds2_sp(data: &[u8]) -> Result<AudioBuffer> {
-    let demuxed = demux_ds2(data)?;
+    let demuxed = demux_ds2_ex(data, ExtractionMode::All)?;
     match demuxed {
         DemuxedDs2::Sp {
             packets,
@@ -82,8 +95,8 @@ fn decode_ds2_sp(data: &[u8]) -> Result<AudioBuffer> {
     }
 }
 
-fn decode_ds2_qp(data: &[u8]) -> Result<AudioBuffer> {
-    let demuxed = demux_ds2(data)?;
+fn decode_ds2_qp(data: &[u8], mode: ExtractionMode) -> Result<AudioBuffer> {
+    let demuxed = demux_ds2_ex(data, mode)?;
     match demuxed {
         DemuxedDs2::Qp {
             segments,
@@ -107,7 +120,18 @@ pub fn decode_and_write(
     output: &Path,
     config: &OutputConfig,
 ) -> Result<AudioBuffer> {
-    let mut buf = decode_file(input)?;
+    decode_and_write_ex(input, output, config, ExtractionMode::All)
+}
+
+/// Decode a file and write to WAV, selecting which frames to include.
+pub fn decode_and_write_ex(
+    input: &Path,
+    output: &Path,
+    config: &OutputConfig,
+    mode: ExtractionMode,
+) -> Result<AudioBuffer> {
+    let data = std::fs::read(input)?;
+    let mut buf = decode_to_buffer_ex(&data, mode)?;
     let target_rate = config.sample_rate.unwrap_or(buf.native_rate);
     if target_rate != buf.native_rate {
         buf.samples = resample(&buf.samples, buf.native_rate, target_rate)?;

@@ -1,5 +1,6 @@
 use clap::Parser;
 use dss_codec::demux::detect_format;
+use dss_codec::demux::ds2::ExtractionMode;
 use dss_codec::output::OutputConfig;
 use std::path::PathBuf;
 
@@ -34,6 +35,19 @@ struct Cli {
     #[arg(short = 'o', long)]
     output_dir: Option<PathBuf>,
 
+    /// What to extract from DS2 QP files that contain annotations:
+    ///   all          — everything in original order (default)
+    ///   main         — main dictation only (skip annotations)
+    ///   annotations  — annotations only (skip main dictation)
+    #[arg(
+        short = 'e',
+        long = "extract",
+        value_name = "CONTENT",
+        default_value = "all",
+        verbatim_doc_comment
+    )]
+    extract: ExtractArg,
+
     /// Suppress output
     #[arg(short = 'q', long)]
     quiet: bool,
@@ -41,6 +55,39 @@ struct Cli {
     /// Print file metadata only
     #[arg(long)]
     info: bool,
+}
+
+/// Clap value type for --extract.
+#[derive(Clone, Copy, Debug)]
+enum ExtractArg {
+    All,
+    Main,
+    Annotations,
+}
+
+impl std::str::FromStr for ExtractArg {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "all"         => Ok(ExtractArg::All),
+            "main"        => Ok(ExtractArg::Main),
+            "annotations" => Ok(ExtractArg::Annotations),
+            other => Err(format!(
+                "unknown value '{}'; expected: all, main, annotations",
+                other
+            )),
+        }
+    }
+}
+
+impl From<ExtractArg> for ExtractionMode {
+    fn from(a: ExtractArg) -> Self {
+        match a {
+            ExtractArg::All         => ExtractionMode::All,
+            ExtractArg::Main        => ExtractionMode::MainOnly,
+            ExtractArg::Annotations => ExtractionMode::AnnotationsOnly,
+        }
+    }
 }
 
 fn main() {
@@ -59,6 +106,8 @@ fn main() {
         channels: cli.channels,
     };
 
+    let mode: ExtractionMode = cli.extract.into();
+
     for input_path in &cli.input {
         let output_path = if let Some(ref out) = cli.output_file {
             if cli.input.len() == 1 {
@@ -74,7 +123,7 @@ fn main() {
             eprintln!("Decoding: {}", input_path.display());
         }
 
-        match dss_codec::decode_and_write(input_path, &output_path, &config) {
+        match dss_codec::decode_and_write_ex(input_path, &output_path, &config, mode) {
             Ok(buf) => {
                 if !cli.quiet {
                     let duration = buf.samples.len() as f64 / buf.native_rate as f64;
@@ -96,7 +145,11 @@ fn main() {
     }
 }
 
-fn make_output_path(input: &PathBuf, output_dir: Option<&std::path::Path>, ext: &str) -> PathBuf {
+fn make_output_path(
+    input: &PathBuf,
+    output_dir: Option<&std::path::Path>,
+    ext: &str,
+) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();
     let filename = format!("{}.{}", stem.to_string_lossy(), ext);
     if let Some(dir) = output_dir {
@@ -114,10 +167,14 @@ fn print_info(path: &PathBuf, _quiet: bool) {
             return;
         }
     };
-
     match detect_format(&data) {
         Some(fmt) => {
-            println!("{}: {:?}, native rate {} Hz", path.display(), fmt, fmt.native_sample_rate());
+            println!(
+                "{}: {:?}, native rate {} Hz",
+                path.display(),
+                fmt,
+                fmt.native_sample_rate()
+            );
         }
         None => {
             println!("{}: unknown format", path.display());
