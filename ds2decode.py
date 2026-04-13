@@ -53,6 +53,7 @@ QP_NUM_SUBFRAMES = 4
 QP_SUBFRAME_SIZE = 64         # 16 * 4.0
 QP_SAMPLES_PER_FRAME = QP_NUM_SUBFRAMES * QP_SUBFRAME_SIZE  # 256
 QP_FRAME_BITS = 448
+QP_FRAME_BYTES = QP_FRAME_BITS // 8  # 56
 QP_MIN_PITCH = 45
 QP_MAX_PITCH = 300
 QP_PITCH_RANGE = QP_MAX_PITCH - QP_MIN_PITCH + 1  # 256
@@ -195,7 +196,7 @@ def read_ds2_file(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    if data[:4] != b'\x03ds2':
+    if data[:4] not in (b'\x03ds2', b'\x01ds2'):
         raise ValueError(f"Not a DS2 file: {path}")
 
     num_blocks = (len(data) - DS2_HEADER_SIZE) // DS2_BLOCK_SIZE
@@ -208,21 +209,71 @@ def read_ds2_file(path):
         total_frames += data[DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE + 2]
 
     if format_type >= 6:
-        # QP mode: continuous bitstream (no byte-swap).
-        # Empty blocks (frame_count=0) contain only continuation bytes; the rest
-        # is garbage that must be discarded. Valid bytes = max(0, byte1*2 - 6),
-        # the same formula as DSS empty blocks (with swap=0).
-        stream = bytearray()
+        # QP mode: segmented bitstream with cut-point detection.
+        #
+        # Byte 1 of every block header encodes a continuation offset:
+        #   payload_off = b1*2 - DS2_BLOCK_HEADER_SIZE
+        # The first payload_off bytes of each block's payload are the tail of a
+        # frame that started in the previous block; the block's own frames begin
+        # at payload_off.
+        #
+        # We concatenate all raw 506-byte payloads into one buffer, then walk the
+        # blocks tracking raw_read_pos (where we are after consuming each block's
+        # frames) vs frames_raw_start (where the next block's own frames begin).
+        # A mismatch signals an edit cut point; we split into separate segments
+        # there and the decoder must reset its state before each new segment.
+
+        payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE  # 506
+
+        raw = bytearray()
         for bi in range(num_blocks):
             bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
-            fc = data[bstart + 2]
+            raw.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
+
+        segments = []
+        seg_raw_start = 0
+        seg_frames = 0
+        raw_read_pos = 0
+        first_seg = True
+
+        for bi in range(num_blocks):
+            bstart = DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE
             b1 = data[bstart + 1]
-            if fc == 0:
-                cont_size = max(0, b1 * 2 - 6)
-                stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_HEADER_SIZE + cont_size])
-            else:
-                stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
-        return bytes(stream), total_frames, 'qp'
+            fc = data[bstart + 2]
+
+            cont_bytes = b1 * 2
+            payload_off = max(0, cont_bytes - DS2_BLOCK_HEADER_SIZE)
+            frames_raw_start = bi * payload_size + payload_off
+
+            if bi == 0:
+                raw_read_pos = frames_raw_start
+                seg_raw_start = frames_raw_start
+            elif frames_raw_start != raw_read_pos:
+                end = min(raw_read_pos, len(raw))
+                if seg_frames > 0 and end > seg_raw_start:
+                    segments.append((
+                        bytes(raw[seg_raw_start:end]),
+                        seg_frames,
+                        not first_seg,
+                    ))
+                    first_seg = False
+                seg_raw_start = frames_raw_start
+                seg_frames = 0
+                raw_read_pos = frames_raw_start
+
+            if fc > 0:
+                seg_frames += fc
+                raw_read_pos += fc * QP_FRAME_BYTES
+
+        end = min(raw_read_pos, len(raw))
+        if seg_frames > 0 and end > seg_raw_start:
+            segments.append((
+                bytes(raw[seg_raw_start:end]),
+                seg_frames,
+                not first_seg,
+            ))
+
+        return segments, total_frames, 'qp'
     else:
         # SP mode: byte-swap demuxing
         stream = bytearray()
@@ -423,21 +474,27 @@ class DS2Decoder:
         all_samples = []
 
         if self.mode == 'qp':
-            all_samples = self._decode_qp_frames(frame_data, total_frames)
+            # QP de-emphasis: y[n] = x[n] + alpha*y[n-1], alpha=0.1
+            # State resets at each cut point alongside the codec state.
+            alpha = 0.1
+            for seg_stream, seg_frames, reset_before in frame_data:
+                if reset_before:
+                    self.lattice_state = np.zeros(self.num_coeffs)
+                    self.pitch_memory = np.zeros(self.max_pitch + self.subframe_size)
+                seg_samples = np.array(
+                    self._decode_qp_frames(seg_stream, seg_frames), dtype=np.float64)
+                deemph = 0.0
+                for i in range(len(seg_samples)):
+                    seg_samples[i] += alpha * deemph
+                    deemph = seg_samples[i]
+                all_samples.append(seg_samples)
+            samples_arr = np.concatenate(all_samples) if all_samples else np.array([], dtype=np.float64)
         else:
             all_samples = self._decode_sp_frames(frame_data, total_frames)
+            samples_arr = np.array(all_samples, dtype=np.float64)
 
-        duration = len(all_samples) / self.sample_rate
+        duration = len(samples_arr) / self.sample_rate
         print(f"Decoded: {total_frames} frames, {duration:.2f}s at {self.sample_rate}Hz")
-
-        samples_arr = np.array(all_samples, dtype=np.float64)
-
-        # QP mode: apply de-emphasis filter y[n] = x[n] + alpha*y[n-1]
-        # Matches DssDecoder.dll FUN_10018ca0 with DAT_10066988 = 0.1
-        if self.mode == 'qp':
-            alpha = 0.1
-            for i in range(1, len(samples_arr)):
-                samples_arr[i] += alpha * samples_arr[i - 1]
 
         # Convert to int16 via truncation (matching DLL's cvttsd2si)
         samples_16 = np.clip(samples_arr, -32768, 32767).astype(np.int16)

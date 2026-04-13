@@ -52,7 +52,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
         return Some(AudioFormat::DssSp);
     }
-    if data[..4] == *b"\x03ds2"
+    if (data[..4] == *b"\x03ds2" || data[..4] == *b"\x01ds2")
         && data.len() > 0x604 {
             let format_type = data[0x600 + 4];
             if format_type >= 6 {

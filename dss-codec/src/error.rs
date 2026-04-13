@@ -25,6 +25,9 @@ pub enum DecodeError {
 
     #[error("resample error: {0}")]
     Resample(String),
+	
+	#[error("No audio error")]
+    NoAudioData,
 }
 
 pub type Result<T> = std::result::Result<T, DecodeError>;

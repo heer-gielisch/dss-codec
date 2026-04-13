@@ -3,9 +3,18 @@
 //! 16 reflection coefficients, 64-sample subframes, 4 subframes/frame,
 //! 11-pulse combinatorial codebook C(64,11), continuous bitstream,
 //! per-subframe pitch encoding (8 bits each), de-emphasis filter.
+//!
+//! ## Cut-file handling
+//!
+//! Use `decode_segments()` when decoding a file that may have been edited.
+//! The demuxer splits the bitstream into `QpSegment`s and sets `reset_before`
+//! on every segment that follows a cut point.  `decode_segments()` calls
+//! `reset()` automatically before those segments so that stale `pitch_memory`
+//! and `lattice_state` from before the cut do not corrupt the audio after it.
 
 use crate::bitstream::BitstreamReader;
 use crate::codec::common::{decode_combinatorial_index, lattice_synthesis};
+use crate::demux::ds2::QpSegment;
 use crate::tables::ds2_qp::qp_codebook_lookup;
 use crate::tables::ds2_quant::{QP_EXCITATION_GAIN, QP_PITCH_GAIN, QP_PULSE_AMP};
 
@@ -16,21 +25,16 @@ const SAMPLES_PER_FRAME: usize = NUM_SUBFRAMES * SUBFRAME_SIZE; // 256
 const MIN_PITCH: u32 = 45;
 const MAX_PITCH: u32 = 300;
 const EXCITATION_PULSES: usize = 11;
-const REFL_BIT_ALLOC: [u32; 16] = [7, 7, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3];
+const REFL_BIT_ALLOC: [u32; NUM_COEFFS] = [7, 7, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3];
 const PITCH_GAIN_BITS: u32 = 6;
 const GAIN_BITS: u32 = 6;
 const PULSE_BITS: u32 = 3;
 const PITCH_BITS: u32 = 8;
-// CB_BITS = ceil(log2(C(64,11))) = ceil(log2(7669339132720)) = 43... actually 40
-// C(64,11) = 7669339132720, log2 ~ 42.8 => 43 bits? No, Python says 40.
-// math.ceil(math.log2(math.comb(64,11))) = 43. Let me recalculate.
-// 2^42 = 4398046511104, 2^43 = 8796093022208
-// C(64,11) = 7669339132720 < 8796093022208 = 2^43, so 43 bits? No.
-// Actually from Python: math.ceil(math.log2(math.comb(64,11))) = 43
-// But the frame is 448 bits total. Let's verify:
-// 76 (refl) + 4*(8+6+CB+6+33) = 76 + 4*(53+CB) = 448
-// 448 - 76 = 372, 372/4 = 93, 93 - 53 = 40. So CB_BITS = 40.
+// CB_BITS: verified from frame layout 76 + 4*(8+6+CB+6+33) = 448 → CB = 40
 const CB_BITS: u32 = 40;
+
+const DEEMPH_ALPHA: f64 = 0.1;
+const PITCH_MEM_LEN: usize = MAX_PITCH as usize + SUBFRAME_SIZE; // 364
 
 pub struct Ds2QpDecoder {
     lattice_state: [f64; NUM_COEFFS],
@@ -48,47 +52,89 @@ impl Ds2QpDecoder {
     pub fn new() -> Self {
         Self {
             lattice_state: [0.0; NUM_COEFFS],
-            pitch_memory: vec![0.0; MAX_PITCH as usize + SUBFRAME_SIZE],
+            pitch_memory: vec![0.0; PITCH_MEM_LEN],
             deemph_state: 0.0,
         }
     }
 
-    /// Decode all QP frames from a continuous bitstream. Returns all samples as f64.
-    /// De-emphasis is applied at the end.
-    pub fn decode_all_frames(&mut self, stream: &[u8], total_frames: usize) -> Vec<f64> {
-        let mut reader = BitstreamReader::new(stream);
-        let mut all_samples = Vec::with_capacity(total_frames * SAMPLES_PER_FRAME);
+    /// Reset all decoder state to zero.
+    ///
+    /// Called automatically by `decode_segments()` before any segment that
+    /// has `reset_before == true` (i.e. every segment after a cut point).
+    pub fn reset(&mut self) {
+        self.lattice_state = [0.0; NUM_COEFFS];
+        self.pitch_memory.fill(0.0);
+        self.deemph_state = 0.0;
+    }
 
-        for _ in 0..total_frames {
-            let samples = self.decode_frame_from_reader(&mut reader);
-            all_samples.extend_from_slice(&samples);
-        }
+    // ── public API ────────────────────────────────────────────────────────────
 
-        // Apply de-emphasis: y[n] = x[n] + 0.1*y[n-1]
-        let alpha = 0.1;
-        if !all_samples.is_empty() {
-            all_samples[0] += alpha * self.deemph_state;
-            for i in 1..all_samples.len() {
-                all_samples[i] += alpha * all_samples[i - 1];
+    /// Decode all segments produced by the demuxer.
+    ///
+    /// Resets decoder state before every segment where `reset_before` is true.
+    /// De-emphasis is applied per segment so the IIR tail cannot leak across
+    /// cut points.
+    ///
+    /// This is the correct entry point for both uncut and cut files.
+    pub fn decode_segments(&mut self, segments: &[QpSegment]) -> Vec<f64> {
+        let total_cap: usize = segments
+            .iter()
+            .map(|s| s.frame_count * SAMPLES_PER_FRAME)
+            .sum();
+        let mut all_samples = Vec::with_capacity(total_cap);
+
+        for seg in segments {
+            if seg.reset_before {
+                self.reset();
             }
-            self.deemph_state = *all_samples.last().unwrap();
+            let samples = self.decode_all_frames(&seg.stream, seg.frame_count);
+            all_samples.extend(samples);
         }
 
         all_samples
     }
 
-    fn decode_frame_from_reader(&mut self, reader: &mut BitstreamReader) -> Vec<f64> {
-        // Read reflection coefficient indices
-        let mut refl_indices = [0usize; NUM_COEFFS];
-        for i in 0..NUM_COEFFS {
-            refl_indices[i] = reader.read_bits(REFL_BIT_ALLOC[i]) as usize;
+    /// Decode `total_frames` QP frames from a raw continuous bitstream.
+    ///
+    /// De-emphasis is applied to the entire output before returning.
+    /// `deemph_state` carries the IIR memory across calls within the same
+    /// segment; call `reset()` between segments.
+    pub fn decode_all_frames(&mut self, stream: &[u8], total_frames: usize) -> Vec<f64> {
+        let mut reader = BitstreamReader::new(stream);
+        let mut samples = Vec::with_capacity(total_frames * SAMPLES_PER_FRAME);
+
+        for _ in 0..total_frames {
+            let frame = self.decode_frame(&mut reader);
+            samples.extend_from_slice(&frame);
         }
 
-        // Read per-subframe parameters (pitch is per-subframe, not combined)
-        let mut subframe_data = Vec::with_capacity(NUM_SUBFRAMES);
-        let mut pitches = Vec::with_capacity(NUM_SUBFRAMES);
+        // Apply de-emphasis: y[n] = x[n] + alpha * y[n-1]
+        if !samples.is_empty() {
+            samples[0] += DEEMPH_ALPHA * self.deemph_state;
+            for i in 1..samples.len() {
+                samples[i] += DEEMPH_ALPHA * samples[i - 1];
+            }
+            self.deemph_state = *samples.last().unwrap();
+        }
 
-        for _ in 0..NUM_SUBFRAMES {
+        samples
+    }
+
+    // ── frame decode ──────────────────────────────────────────────────────────
+
+    fn decode_frame(&mut self, reader: &mut BitstreamReader) -> Vec<f64> {
+        // 1. Read 16 reflection coefficient indices.
+        let mut refl_indices = [0usize; NUM_COEFFS];
+        for (i, &bits) in REFL_BIT_ALLOC.iter().enumerate() {
+            refl_indices[i] = reader.read_bits(bits) as usize;
+        }
+
+        // 2. Read per-subframe parameters.
+        //    QP uses absolute per-subframe pitch: pitch = index + MIN_PITCH.
+        let mut subframe_params = Vec::with_capacity(NUM_SUBFRAMES);
+        let mut pitches = [0usize; NUM_SUBFRAMES];
+
+        for sf in 0..NUM_SUBFRAMES {
             let pitch_idx = reader.read_bits(PITCH_BITS);
             let pg_idx = reader.read_bits(PITCH_GAIN_BITS) as usize;
             let cb_idx = reader.read_bits_u64(CB_BITS);
@@ -97,29 +143,31 @@ impl Ds2QpDecoder {
             for p in &mut pulses {
                 *p = reader.read_bits(PULSE_BITS) as usize;
             }
-            pitches.push(pitch_idx + MIN_PITCH);
-            subframe_data.push((pg_idx, cb_idx, gain_idx, pulses));
+            pitches[sf] = (pitch_idx + MIN_PITCH) as usize;
+            subframe_params.push((pg_idx, cb_idx, gain_idx, pulses));
         }
 
-        // Dequantize reflection coefficients
+        // 3. Dequantize reflection coefficients.
         let mut coeffs = [0.0f64; NUM_COEFFS];
         for i in 0..NUM_COEFFS {
             coeffs[i] = qp_codebook_lookup(i, refl_indices[i]);
         }
 
-        // Decode subframes
-        let mut all_output = Vec::with_capacity(SAMPLES_PER_FRAME);
+        // 4. Synthesise subframes.
+        let mut frame_output = Vec::with_capacity(SAMPLES_PER_FRAME);
 
         for sf in 0..NUM_SUBFRAMES {
-            let (pg_idx, cb_idx, gain_idx, pulses) = &subframe_data[sf];
-            let pitch = pitches[sf] as usize;
+            let (pg_idx, cb_idx, gain_idx, pulses) = &subframe_params[sf];
+            let pitch = pitches[sf];
             let gp = QP_PITCH_GAIN[*pg_idx];
+            let gc = QP_EXCITATION_GAIN[*gain_idx];
 
-            // Adaptive excitation from pitch memory
+            // 4a. Adaptive excitation: look back `pitch` samples in pitch memory.
             let mut adaptive_exc = [0.0f64; SUBFRAME_SIZE];
             let mem_len = self.pitch_memory.len();
             for i in 0..SUBFRAME_SIZE {
                 let mem_idx = if pitch < SUBFRAME_SIZE {
+                    // Short pitch: repeat cyclically within the subframe.
                     mem_len - pitch + (i % pitch)
                 } else {
                     mem_len - pitch + i
@@ -129,8 +177,7 @@ impl Ds2QpDecoder {
                 }
             }
 
-            // Fixed codebook excitation
-            let gc = QP_EXCITATION_GAIN[*gain_idx];
+            // 4b. Fixed codebook excitation: 11 pulses, C(64,11) codebook.
             let positions =
                 decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES);
             let mut fixed_exc = [0.0f64; SUBFRAME_SIZE];
@@ -140,24 +187,26 @@ impl Ds2QpDecoder {
                 }
             }
 
-            // Total excitation
+            // 4c. Combine.
             let mut excitation = [0.0f64; SUBFRAME_SIZE];
             for i in 0..SUBFRAME_SIZE {
                 excitation[i] = gp * adaptive_exc[i] + fixed_exc[i];
             }
 
-            // Lattice synthesis
-            let output = lattice_synthesis(&excitation, &coeffs, &mut self.lattice_state);
+            // 4d. Lattice synthesis filter.
+            let output =
+                lattice_synthesis(&excitation, &coeffs, &mut self.lattice_state);
 
-            // Update pitch memory
-            let mem_len = self.pitch_memory.len();
+            // 4e. Update pitch memory: shift left, append new excitation.
+            //     The Olympus QP codec uses open-loop pitch prediction on the
+            //     excitation domain — pitch_memory stores excitation, not output.
             self.pitch_memory.copy_within(SUBFRAME_SIZE..mem_len, 0);
-            let start = mem_len - SUBFRAME_SIZE;
-            self.pitch_memory[start..].copy_from_slice(&excitation);
+            let tail = mem_len - SUBFRAME_SIZE;
+            self.pitch_memory[tail..].copy_from_slice(&excitation);
 
-            all_output.extend_from_slice(&output);
+            frame_output.extend_from_slice(&output);
         }
 
-        all_output
+        frame_output
     }
 }
