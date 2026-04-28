@@ -49,7 +49,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data.len() < 4 {
         return None;
     }
-    if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
+    if data[1..4] == *b"dss" {
         return Some(AudioFormat::DssSp);
     }
     if data[1..4] == *b"ds2" && (data[0] == 0x01 || data[0] == 0x03 || data[0] == 0x07) {
