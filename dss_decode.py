@@ -195,19 +195,19 @@ def _formula(a, b, c):
 # ==============================================================================
 
 def read_dss_file(path):
-    """Read DSS file, extract frame packets via block-aware byte-swap demuxing.
-
-    Handles empty blocks (frame_count=0) correctly by:
-    1. Only including continuation bytes from empty block payloads
-    2. Resetting swap state at block group boundaries using block headers
+    """Read DSS file, detect edit cut points, return segments for independent decoding.
 
     Block header layout:
-        byte0 bit7: swap state at block start
-        byte1: first-frame offset = 2*byte1 + 2*swap (from block start)
+        byte0 bit7: swap state for first frame starting in this block
+        byte1: first-frame offset = 2*byte1 + 2*swap (from block start incl. header)
         byte2: frame_count (frames starting in this block)
 
-    Returns: (frame_packets, total_frames)
-        frame_packets: list of 42-byte packets
+    Cut-point detection: concatenate all raw payloads, compute where each block's
+    frames begin (frames_raw_start = bi * 506 + cont_size). A mismatch with
+    raw_read_pos means an edit boundary — start a new segment there and reset state.
+
+    Returns: (segments, total_frames)
+        segments: list of (raw_bytes, frame_count, init_swap, reset_before)
     """
     with open(path, 'rb') as f:
         data = f.read()
@@ -218,55 +218,77 @@ def read_dss_file(path):
     version = data[0]
     header_size = version * DSS_BLOCK_SIZE
     num_blocks = (len(data) - header_size) // DSS_BLOCK_SIZE
+    payload_size = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE  # 506
 
-    # Parse block headers
-    blocks = []
-    total_frames = 0
+    total_frames = sum(data[header_size + bi * DSS_BLOCK_SIZE + 2]
+                       for bi in range(num_blocks))
+
+    # Concatenate all raw payloads
+    raw = bytearray()
+    for bi in range(num_blocks):
+        bstart = header_size + bi * DSS_BLOCK_SIZE
+        raw.extend(data[bstart + DSS_BLOCK_HEADER_SIZE:bstart + DSS_BLOCK_SIZE])
+
+    # Detect cut points and build segments
+    segments = []
+    seg_raw_start = 0
+    seg_frames = 0
+    seg_swap = 0
+    raw_read_pos = 0
+    current_swap = 0
+    first_seg = True
+
     for bi in range(num_blocks):
         bstart = header_size + bi * DSS_BLOCK_SIZE
         byte0 = data[bstart]
         byte1 = data[bstart + 1]
-        frame_count = data[bstart + 2]
+        fc = data[bstart + 2]
         blk_swap = (byte0 >> 7) & 1
         cont_size = max(0, 2 * byte1 + 2 * blk_swap - DSS_BLOCK_HEADER_SIZE)
-        blocks.append((frame_count, blk_swap, cont_size,
-                        data[bstart + DSS_BLOCK_HEADER_SIZE:bstart + DSS_BLOCK_SIZE]))
-        total_frames += frame_count
+        frames_raw_start = bi * payload_size + cont_size
 
-    # Build stream: for empty blocks, only include continuation bytes.
-    # Track positions where swap state needs resetting.
-    stream = bytearray()
-    swap_reset_positions = {}
-    pos = 0
-    for bi, (fc, blk_swap, cont_size, payload) in enumerate(blocks):
-        if fc == 0:
-            stream.extend(payload[:cont_size])
-            pos += cont_size
-            # Find next non-empty block and record its swap state
-            for nbi in range(bi + 1, len(blocks)):
-                if blocks[nbi][0] > 0:
-                    swap_reset_positions[pos] = blocks[nbi][1]
-                    break
-        else:
-            stream.extend(payload)
-            pos += len(payload)
+        if bi == 0:
+            raw_read_pos = frames_raw_start
+            seg_raw_start = frames_raw_start
+            seg_swap = blk_swap
+            current_swap = blk_swap
+        elif fc > 0 and frames_raw_start != raw_read_pos:
+            if seg_frames > 0:
+                segments.append((bytes(raw[seg_raw_start:raw_read_pos]),
+                                  seg_frames, seg_swap, not first_seg))
+                first_seg = False
+            seg_raw_start = frames_raw_start
+            seg_frames = 0
+            seg_swap = blk_swap
+            current_swap = blk_swap
+            raw_read_pos = frames_raw_start
 
-    # Byte-swap demuxing with swap resets at block group boundaries
-    swap = blocks[0][1]
+        if fc > 0:
+            seg_frames += fc
+            for _ in range(fc):
+                raw_read_pos += 40 if current_swap else DSS_SP_FRAME_SIZE
+                current_swap ^= 1
+
+    if seg_frames > 0:
+        segments.append((bytes(raw[seg_raw_start:raw_read_pos]),
+                          seg_frames, seg_swap, not first_seg))
+
+    return segments, total_frames
+
+
+def _demux_segment(raw_segment, frame_count, init_swap):
+    """Byte-swap demux a raw segment into DSS_SP_FRAME_SIZE-byte packets."""
+    swap = init_swap
     swap_byte = 0
     pos = 0
     frame_packets = []
 
-    for fi in range(total_frames):
-        if pos in swap_reset_positions:
-            swap = swap_reset_positions[pos]
-            swap_byte = 0
-
+    for _ in range(frame_count):
         pkt = bytearray(DSS_SP_FRAME_SIZE + 1)
         if swap:
             read_size = 40
-            end = min(pos + read_size, len(stream))
-            pkt[3:3 + (end - pos)] = stream[pos:end]
+            end = min(pos + read_size, len(raw_segment))
+            pkt[3:3 + (end - pos)] = raw_segment[pos:end]
             pos += read_size
             for i in range(0, DSS_SP_FRAME_SIZE - 2, 2):
                 pkt[i] = pkt[i + 4]
@@ -274,15 +296,15 @@ def read_dss_file(path):
             pkt[1] = swap_byte
         else:
             read_size = DSS_SP_FRAME_SIZE
-            end = min(pos + read_size, len(stream))
-            pkt[:end - pos] = stream[pos:end]
+            end = min(pos + read_size, len(raw_segment))
+            pkt[:end - pos] = raw_segment[pos:end]
             pos += read_size
             swap_byte = pkt[DSS_SP_FRAME_SIZE - 2]
         pkt[DSS_SP_FRAME_SIZE - 2] = 0
         swap ^= 1
         frame_packets.append(bytes(pkt[:DSS_SP_FRAME_SIZE]))
 
-    return frame_packets, total_frames
+    return frame_packets
 
 
 # ==============================================================================
@@ -650,6 +672,21 @@ class DSSDecoder:
         # Truncate to 264 samples
         return output[:DSS_SP_SAMPLE_COUNT]
 
+    def _reset_state(self):
+        """Reset all decoder state for a new independent segment."""
+        self.excitation = [0] * (288 + 6)
+        self.history = [0] * 187
+        self.working_buffer = [[0] * 72 for _ in range(DSS_SP_SUBFRAMES)]
+        self.audio_buf = [0] * 15
+        self.err_buf1 = [0] * 15
+        self.err_buf2 = [0] * 15
+        self.lpc_filter = [0] * 14
+        self.filter = [0] * 15
+        self.vector_buf = [0] * 72
+        self.noise_state = 0
+        self.pulse_dec_mode = 1
+        self.shift_amount = 0
+
     def decode_frame(self, pkt):
         """Decode one DSS SP frame, returning 264 int16 samples."""
         filter_idx, sf_adaptive_gain, pitch_lag, subframes = \
@@ -680,13 +717,17 @@ class DSSDecoder:
         return output
 
     def decode_file(self, dss_path, wav_path=None):
-        """Decode entire DSS file to samples."""
-        frame_packets, total_frames = read_dss_file(dss_path)
+        """Decode entire DSS file to samples, resetting state at edit cut points."""
+        segments, total_frames = read_dss_file(dss_path)
 
         all_samples = []
-        for fi in range(total_frames):
-            samples = self.decode_frame(frame_packets[fi])
-            all_samples.extend(samples)
+        for seg_raw, seg_frames, seg_swap, reset_before in segments:
+            if reset_before:
+                self._reset_state()
+            frame_packets = _demux_segment(seg_raw, seg_frames, seg_swap)
+            for fi in range(seg_frames):
+                samples = self.decode_frame(frame_packets[fi])
+                all_samples.extend(samples)
 
         duration = len(all_samples) / DSS_SP_SAMPLE_RATE
         print(f"Decoded: {total_frames} frames, {duration:.2f}s at {DSS_SP_SAMPLE_RATE}Hz")
