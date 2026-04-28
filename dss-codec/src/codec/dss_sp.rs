@@ -70,6 +70,10 @@ impl DssSpDecoder {
         }
     }
 
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     pub fn decode_frame(&mut self, pkt: &[u8]) -> Vec<i16> {
         let (filter_idx, sf_adaptive_gain, pitch_lag, subframes) = self.unpack_coeffs(pkt);
 

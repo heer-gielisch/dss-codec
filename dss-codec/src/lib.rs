@@ -9,7 +9,7 @@ use crate::codec::ds2_qp::Ds2QpDecoder;
 use crate::codec::ds2_sp::Ds2SpDecoder;
 use crate::codec::dss_sp::DssSpDecoder;
 use crate::demux::ds2::{demux_ds2_ex, DemuxedDs2, ExtractionMode};
-use crate::demux::dss::demux_dss;
+use crate::demux::dss::{demux_dss, demux_segment};
 use crate::demux::{detect_format, AudioFormat};
 use crate::error::{DecodeError, Result};
 use crate::output::resample::resample;
@@ -58,12 +58,18 @@ pub fn decode_to_buffer_ex(data: &[u8], mode: ExtractionMode) -> Result<AudioBuf
 }
 
 fn decode_dss_sp(data: &[u8]) -> Result<AudioBuffer> {
-    let (packets, total_frames) = demux_dss(data)?;
+    let (segments, total_frames) = demux_dss(data)?;
     let mut decoder = DssSpDecoder::new();
     let mut all_samples = Vec::with_capacity(total_frames * 264);
-    for pkt in &packets {
-        let frame_samples = decoder.decode_frame(pkt);
-        all_samples.extend(frame_samples.iter().map(|&s| s as f64));
+    for seg in &segments {
+        if seg.reset_before {
+            decoder.reset();
+        }
+        let packets = demux_segment(seg);
+        for pkt in &packets {
+            let frame_samples = decoder.decode_frame(pkt);
+            all_samples.extend(frame_samples.iter().map(|&s| s as f64));
+        }
     }
     Ok(AudioBuffer {
         samples: all_samples,
