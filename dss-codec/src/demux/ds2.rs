@@ -133,7 +133,18 @@ pub fn demux_ds2_ex(data: &[u8], mode: ExtractionMode) -> Result<DemuxedDs2> {
         return Err(DecodeError::NoAudioData);
     }
 
-    let format_type = data[header_size + 4];
+    // Detect format from byte 4 of the first block that actually carries
+    // frames. Some files (notably the \x07ds2 variant) have leading
+    // zero-padding blocks whose header bytes are all zero; reading byte 4
+    // there would falsely route a QP file to the SP branch.
+    let mut format_type: u8 = 0;
+    for bi in 0..num_blocks {
+        let bstart = header_size + bi * DS2_BLOCK_SIZE;
+        if data[bstart + 2] > 0 {
+            format_type = data[bstart + 4];
+            break;
+        }
+    }
 
     if format_type >= 6 {
         demux_qp(data, num_blocks, header_size, mode)

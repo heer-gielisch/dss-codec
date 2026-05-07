@@ -204,8 +204,16 @@ def read_ds2_file(path):
 
     num_blocks = (len(data) - header_size) // DS2_BLOCK_SIZE
 
-    # Detect format from first block header byte 4
-    format_type = data[header_size + 4]
+    # Detect format from byte 4 of the first block that actually carries frames.
+    # Some files (notably the \x07ds2 variant) have leading zero-padding blocks
+    # whose header bytes are all zero; reading byte 4 there would falsely route
+    # a QP file to the SP branch.
+    format_type = 0
+    for bi in range(num_blocks):
+        bstart = header_size + bi * DS2_BLOCK_SIZE
+        if data[bstart + 2] > 0:
+            format_type = data[bstart + 4]
+            break
 
     total_frames = 0
     for bi in range(num_blocks):

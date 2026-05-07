@@ -55,7 +55,19 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"ds2" && (data[0] == 0x01 || data[0] == 0x03 || data[0] == 0x07) {
         let header_size = if data[0] == 0x07 { 0x1000usize } else { 0x600usize };
         if data.len() > header_size + 4 {
-            let format_type = data[header_size + 4];
+            // Scan for the first block with frame_count > 0; the \x07ds2 variant
+            // has leading zero-padding blocks whose byte-4 is 0 and would
+            // misroute a QP file to the SP branch.
+            const BLOCK_SIZE: usize = 512;
+            let num_blocks = (data.len() - header_size) / BLOCK_SIZE;
+            let mut format_type: u8 = 0;
+            for bi in 0..num_blocks {
+                let bstart = header_size + bi * BLOCK_SIZE;
+                if data[bstart + 2] > 0 {
+                    format_type = data[bstart + 4];
+                    break;
+                }
+            }
             if format_type >= 6 {
                 return Some(AudioFormat::Ds2Qp);
             } else {
