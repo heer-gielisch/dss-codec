@@ -17,7 +17,7 @@ struct BlockInfo {
 }
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
-    if data.len() < 4 || data[1..4] != *b"dss" || (data[0] != 2 && data[0] != 3) {
+    if data.len() < 4 || data[1..4] != *b"dss" || !matches!(data[0], 2 | 3 | 7) {
         return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
     }
 

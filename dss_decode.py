@@ -212,7 +212,9 @@ def read_dss_file(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    if data[1:4] != b'dss' or data[0] not in (2, 3):
+    # DSS files use the first byte as a header-size variant (in 512-byte
+    # blocks). Older recordings commonly use 2 or 3; new ones use 7.
+    if data[1:4] != b'dss' or data[0] not in (2, 3, 7):
         raise ValueError(f"Not a DSS file: {path}")
 
     version = data[0]
