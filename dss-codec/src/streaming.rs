@@ -215,7 +215,13 @@ impl StreamingDecoder {
     }
 
     fn push_active(&mut self, bytes: &[u8]) -> Result<Vec<f64>> {
-        if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
+        // Correct DSS compact-block handling depends on segment boundaries
+        // later in the file. Buffer DSS just like QP and use the canonical
+        // block-aware batch demuxer at finish.
+        if matches!(
+            self.format,
+            Some(AudioFormat::DssSp | AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)
+        ) {
             self.raw_buf.extend_from_slice(bytes);
             return Ok(Vec::new());
         }
@@ -232,6 +238,9 @@ impl StreamingDecoder {
     }
 
     fn finish_active(&mut self) -> Result<Vec<f64>> {
+        if self.format == Some(AudioFormat::DssSp) {
+            return self.decode_buffered_dss();
+        }
         if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
             return self.decode_buffered_ds2_qp();
         }
@@ -248,6 +257,9 @@ impl StreamingDecoder {
     }
 
     fn finish_active_lenient(&mut self) -> Result<Vec<f64>> {
+        if self.format == Some(AudioFormat::DssSp) {
+            return self.decode_buffered_dss();
+        }
         if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
             return self.decode_buffered_ds2_qp();
         }
@@ -274,6 +286,11 @@ impl StreamingDecoder {
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    fn decode_buffered_dss(&mut self) -> Result<Vec<f64>> {
+        let (frames, _) = crate::demux::dss::demux_dss(&self.raw_buf)?;
+        self.decode_frames(frames)
     }
 
     fn decode_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<Vec<f64>> {
