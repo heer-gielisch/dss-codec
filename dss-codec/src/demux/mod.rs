@@ -99,6 +99,13 @@ mod tests {
     }
 
     #[test]
+    fn detect_format_recognizes_dss_header_variant_7() {
+        let mut data = vec![0u8; 4];
+        data[..4].copy_from_slice(b"\x07dss");
+        assert_eq!(detect_format(&data), Some(AudioFormat::DssSp));
+    }
+
+    #[test]
     fn detect_format_recognizes_encrypted_ds2_qp() {
         let data = make_ds2_like_file(*b"\x03enc", 6);
         assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));

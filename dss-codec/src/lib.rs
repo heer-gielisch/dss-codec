@@ -119,9 +119,9 @@ pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
 
 /// Decode raw file bytes to an AudioBuffer, optionally decrypting encrypted DS2 input first.
 pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> Result<AudioBuffer> {
-    // DSS SP: use the block-aware batch demuxer, which handles mid-stream
-    // compact (short/padded) blocks. The streaming demuxer concatenates full
-    // block payloads and mis-reads compact-block padding as audio.
+    // DSS SP: use the canonical block-aware batch demuxer, which handles
+    // compact blocks and pause/resume alignment. Streaming DSS decoding also
+    // buffers until finish and delegates to this same path.
     if detect_format(data) == Some(AudioFormat::DssSp) {
         let (packets, _total) = crate::demux::dss::demux_dss(data)?;
         let mut decoder = crate::codec::dss_sp::DssSpDecoder::new();

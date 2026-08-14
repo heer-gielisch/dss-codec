@@ -8,6 +8,24 @@ use std::collections::VecDeque;
 const DSS_BLOCK_SIZE: usize = 512;
 const DSS_BLOCK_HEADER_SIZE: usize = 6;
 const DSS_SP_FRAME_SIZE: usize = 42;
+const DSS_BLOCK_PAYLOAD: usize = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE;
+
+fn stored_frame_bytes(frame_count: usize, start_swap: usize) -> usize {
+    (0..frame_count)
+        .map(|i| {
+            if (start_swap ^ (i & 1)) != 0 {
+                DSS_SP_FRAME_SIZE - 2
+            } else {
+                DSS_SP_FRAME_SIZE
+            }
+        })
+        .sum()
+}
+
+fn is_compact_block(frame_count: usize, start_swap: usize, continuation_size: usize) -> bool {
+    frame_count > 0
+        && stored_frame_bytes(frame_count, start_swap) + continuation_size <= DSS_BLOCK_PAYLOAD
+}
 
 struct BlockInfo {
     frame_count: usize,
@@ -23,6 +41,9 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 
     let version = data[0] as usize;
     let header_size = version * DSS_BLOCK_SIZE;
+    if data.len() < header_size {
+        return Err(DecodeError::Truncated("DSS header".to_string()));
+    }
     let num_blocks = (data.len() - header_size) / DSS_BLOCK_SIZE;
 
     let mut blocks = Vec::with_capacity(num_blocks);
@@ -50,7 +71,10 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     // Track positions where swap state needs resetting.
     //
     // A "compact" (short) block declares frames that fit entirely within its
-    // payload (fc*42 + poff <= payload) leaving 0xFF padding after them. This
+    // payload, leaving padding after them. DSS SP alternates between 42-byte
+    // and 40-byte stored frames, so this test must include the starting swap
+    // phase. Assuming fc*42 misses valid compact blocks and feeds their padding
+    // into the next packet. This
     // marks a recording pause/segment boundary: the demuxer must stop at the
     // declared frames, skip the padding, and restart framing on the next block
     // (whose leading continuation offset is then spurious and skipped). Full
@@ -59,21 +83,6 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     // a normal partial end and is treated as full (padding never reached
     // because the frame walk stops at total_frames). See libavformat/dss.c
     // dss_block_payload_fits / dss_align_after_compact_block.
-    const DSS_BLOCK_PAYLOAD: usize = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE;
-    let frame_bytes = |fc: usize, start_swap: usize| -> usize {
-        let mut n = 0;
-        for i in 0..fc {
-            n += if (start_swap ^ (i & 1)) != 0 {
-                DSS_SP_FRAME_SIZE - 2
-            } else {
-                DSS_SP_FRAME_SIZE
-            };
-        }
-        n
-    };
-    let is_compact =
-        |fc: usize, poff: usize| fc > 0 && fc * DSS_SP_FRAME_SIZE + poff <= DSS_BLOCK_PAYLOAD;
-
     // Each reset position carries (new_swap, reset_swap_byte). Empty-block
     // boundaries clear the carried swap byte (matching the DLL's empty-block
     // path); compact-block realignments preserve it, or the first swap=1 frame
@@ -81,8 +90,11 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let mut stream = Vec::new();
     let mut swap_reset_positions: std::collections::HashMap<usize, (usize, bool)> =
         std::collections::HashMap::new();
+    let mut swap_byte_reset_positions: std::collections::HashMap<usize, u8> =
+        std::collections::HashMap::new();
     let mut pos: usize = 0;
     let mut skip_next_poff = false;
+    let mut after_empty_blocks = false;
 
     for bi in 0..blocks.len() {
         let poff = blocks[bi].cont_size;
@@ -99,15 +111,24 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
                 }
             }
             skip_next_poff = false;
-        } else if is_compact(blocks[bi].frame_count, poff) && bi + 1 < blocks.len() {
+            after_empty_blocks = true;
+        } else if is_compact_block(blocks[bi].frame_count, blocks[bi].swap, poff)
+            && bi + 1 < blocks.len()
+        {
             // Mid-stream compact block: real frames then padding.
-            let own = frame_bytes(blocks[bi].frame_count, blocks[bi].swap);
-            if skip_next_poff {
+            let own = stored_frame_bytes(blocks[bi].frame_count, blocks[bi].swap);
+            if skip_next_poff || after_empty_blocks {
                 // Previous block ended clean: leading poff bytes are spurious.
                 let start = poff.min(payload.len());
                 let end = (poff + own).min(payload.len());
                 stream.extend_from_slice(&payload[start..end]);
-                swap_reset_positions.insert(pos, (blocks[bi].swap, false));
+                swap_reset_positions.insert(pos, (blocks[bi].swap, after_empty_blocks));
+                // A swapped first frame carries one byte immediately before
+                // the declared offset even though the rest of that prefix is
+                // padding after an empty-block run.
+                if after_empty_blocks && blocks[bi].swap != 0 && start >= 2 {
+                    swap_byte_reset_positions.insert(pos, payload[start - 2]);
+                }
                 pos += end - start;
             } else {
                 // Leading poff bytes complete the previous spanning frame.
@@ -120,14 +141,19 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             // the carried swap byte.
             swap_reset_positions.insert(pos, (blocks[bi + 1].swap, false));
             skip_next_poff = true;
-        } else if skip_next_poff {
+            after_empty_blocks = false;
+        } else if skip_next_poff || after_empty_blocks {
             // Full block immediately after a compact boundary: skip its
             // spurious continuation offset and restart framing here.
             let start = poff.min(payload.len());
             stream.extend_from_slice(&payload[start..]);
-            swap_reset_positions.insert(pos, (blocks[bi].swap, false));
+            swap_reset_positions.insert(pos, (blocks[bi].swap, after_empty_blocks));
+            if after_empty_blocks && blocks[bi].swap != 0 && start >= 2 {
+                swap_byte_reset_positions.insert(pos, payload[start - 2]);
+            }
             pos += payload.len() - start;
             skip_next_poff = false;
+            after_empty_blocks = false;
         } else {
             stream.extend_from_slice(&payload);
             pos += payload.len();
@@ -145,6 +171,9 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
             swap = new_swap;
             if reset_swap_byte {
                 swap_byte = 0;
+            }
+            if let Some(&carried_byte) = swap_byte_reset_positions.get(&spos) {
+                swap_byte = carried_byte;
             }
         }
 
@@ -449,6 +478,57 @@ mod tests {
         let actual = collect_frames(&mut demuxer, &data, 149);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_compact_block_size_uses_swap_phase() {
+        // Six 40-byte frames save twelve bytes. With an eight-byte leading
+        // offset this block occupies 500 bytes and is compact, although the
+        // old frame_count*42 calculation incorrectly reported 512 bytes.
+        assert_eq!(stored_frame_bytes(12, 0), 492);
+        assert!(is_compact_block(12, 0, 8));
+    }
+
+    #[test]
+    fn test_dss_empty_run_resume_recovers_carried_swap_byte() {
+        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
+        data[0] = 2;
+        data[1..4].copy_from_slice(b"dss");
+
+        let empty = make_dss_block(0, 3, 0, 0);
+        data.extend_from_slice(&empty);
+
+        // cont_size = 2*90 + 2 - 6 = 176. Bytes 0..173 are padding,
+        // byte 174 is the carried byte, and frame data begins at byte 176.
+        let mut resumed = make_dss_block(1, 90, 2, 0);
+        let payload = &mut resumed[DSS_BLOCK_HEADER_SIZE..];
+        payload.fill(0);
+        payload[174] = 0x5c;
+        for (i, byte) in payload[176..258].iter_mut().enumerate() {
+            *byte = 0x20u8.wrapping_add(i as u8);
+        }
+        data.extend_from_slice(&resumed);
+
+        // A following block makes the resumed block a mid-stream compact
+        // block, matching a pause followed by another recording segment.
+        data.extend_from_slice(&make_dss_block(0, 3, 1, 0x80));
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0][1], 0x5c);
+    }
+
+    #[test]
+    fn test_dss_header_variant_7_demuxes() {
+        let mut data = vec![0u8; 7 * DSS_BLOCK_SIZE];
+        data[0] = 7;
+        data[1..4].copy_from_slice(b"dss");
+        data.extend_from_slice(&make_dss_block(0, 3, 1, 0x40));
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(frames.len(), 1);
     }
 
     #[test]

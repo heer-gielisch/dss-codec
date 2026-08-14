@@ -269,7 +269,10 @@ impl DssSpDecoder {
                             decode_pulse_pos_table(cp, &mut subframes[j].pulse_pos);
                         }
                     }
-                } else if self.pulse_dec_mode {
+                } else {
+                    // pulse_dec_mode controls exceptional/alternate values;
+                    // one such value must not suppress later ordinary table
+                    // decodes for the remainder of the recording.
                     decode_pulse_pos_table(combined, &mut subframes[j].pulse_pos);
                 }
             } else {
