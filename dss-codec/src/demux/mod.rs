@@ -61,7 +61,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && data[0] == 6 {
         return Some(AudioFormat::GrundigSp);
     }
-    if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
+    if data[1..4] == *b"dss" && matches!(data[0], 2 | 3 | 7) {
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() > 0x604 {
@@ -114,5 +114,10 @@ mod tests {
     fn detect_format_recognizes_encrypted_ds2_sp() {
         let data = make_ds2_like_file(*b"\x03enc", 0);
         assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Sp));
+    }
+
+    #[test]
+    fn detect_format_recognizes_dss_header_variant_7() {
+        assert_eq!(detect_format(b"\x07dss"), Some(AudioFormat::DssSp));
     }
 }
