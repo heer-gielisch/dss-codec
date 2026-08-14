@@ -194,12 +194,14 @@ def _formula(a, b, c):
 # DSS file reader
 # ==============================================================================
 
-def read_dss_file(path):
-    """Read DSS file, extract frame packets via block-aware byte-swap demuxing.
+def read_dss_file(path, debug=False):
+    """Read DSS file and reconstruct its 42-byte SP frame packets.
 
-    Handles empty blocks (frame_count=0) correctly by:
-    1. Only including continuation bytes from empty block payloads
-    2. Resetting swap state at block group boundaries using block headers
+    DSS audio is stored in 512-byte blocks.  In addition to ordinary full
+    blocks, recordings can contain empty blocks and non-empty *compact*
+    blocks.  A compact block contains all of its declared frames followed by
+    padding, and marks a recording pause.  Treating that padding as audio
+    shifts every subsequent packet and turns the remaining audio into noise.
 
     Block header layout:
         byte0 bit7: swap state at block start
@@ -235,11 +237,32 @@ def read_dss_file(path):
                         data[bstart + DSS_BLOCK_HEADER_SIZE:bstart + DSS_BLOCK_SIZE]))
         total_frames += frame_count
 
-    # Build stream: for empty blocks, only include continuation bytes.
-    # Track positions where swap state needs resetting.
+    # A compact block's frames fit in its own payload.  DSS SP alternates
+    # between 42-byte and 40-byte stored frames, so compactness must be tested
+    # using the actual swap phase.  Using 42 bytes for every frame misses
+    # valid compact blocks whose short-frame savings are occupied by padding;
+    # that padding then becomes the prefix of the first resumed packet.
+    payload_size = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE
+
+    def frame_bytes(frame_count, start_swap):
+        return sum(40 if start_swap ^ (i & 1) else DSS_SP_FRAME_SIZE
+                   for i in range(frame_count))
+
+    def is_compact(frame_count, start_swap, continuation_size):
+        return (frame_count > 0 and
+                frame_bytes(frame_count, start_swap) + continuation_size <= payload_size)
+
+    # Build a compacted byte stream and retain the framing resets that occur at
+    # pause boundaries.  reset_swap_byte is True only for empty-block paths;
+    # compact-block realignment must preserve the carried byte used by a
+    # following swapped packet.
     stream = bytearray()
     swap_reset_positions = {}
+    swap_byte_reset_positions = {}
     pos = 0
+    skip_next_continuation = False
+    after_empty_blocks = False
+    debug_events = []
     for bi, (fc, blk_swap, cont_size, payload) in enumerate(blocks):
         if fc == 0:
             stream.extend(payload[:cont_size])
@@ -247,8 +270,52 @@ def read_dss_file(path):
             # Find next non-empty block and record its swap state
             for nbi in range(bi + 1, len(blocks)):
                 if blocks[nbi][0] > 0:
-                    swap_reset_positions[pos] = blocks[nbi][1]
+                    swap_reset_positions[pos] = (blocks[nbi][1], True)
                     break
+            skip_next_continuation = False
+            after_empty_blocks = True
+        elif is_compact(fc, blk_swap, cont_size) and bi + 1 < len(blocks):
+            # A mid-stream compact block consists of real frames followed by
+            # padding.  Skip that padding and align the next block as a fresh
+            # frame group.  Its continuation bytes are spurious when the
+            # preceding compact block ended cleanly.
+            own_size = frame_bytes(fc, blk_swap)
+            if skip_next_continuation or after_empty_blocks:
+                start = min(cont_size, len(payload))
+                end = min(cont_size + own_size, len(payload))
+                stream.extend(payload[start:end])
+                # With no preceding spanning frame, the leading offset is
+                # padding rather than continuation.  A swapped first frame
+                # still stores its carried byte two bytes before that offset.
+                reset_swap_byte = after_empty_blocks
+                swap_reset_positions[pos] = (blk_swap, reset_swap_byte)
+                if after_empty_blocks and blk_swap and start >= 2:
+                    swap_byte_reset_positions[pos] = payload[start - 2]
+                pos += end - start
+            else:
+                end = min(cont_size + own_size, len(payload))
+                stream.extend(payload[:end])
+                swap_reset_positions[pos + cont_size] = (blk_swap, False)
+                pos += end
+
+            # The following block begins a new group; preserve swap_byte.
+            swap_reset_positions[pos] = (blocks[bi + 1][1], False)
+            skip_next_continuation = True
+            after_empty_blocks = False
+            if debug:
+                debug_events.append(
+                    f"compact block={bi} frames={fc} cont={cont_size} "
+                    f"own_bytes={own_size} next_swap={blocks[bi + 1][1]}")
+        elif skip_next_continuation or after_empty_blocks:
+            start = min(cont_size, len(payload))
+            stream.extend(payload[start:])
+            reset_swap_byte = after_empty_blocks
+            swap_reset_positions[pos] = (blk_swap, reset_swap_byte)
+            if after_empty_blocks and blk_swap and start >= 2:
+                swap_byte_reset_positions[pos] = payload[start - 2]
+            pos += len(payload) - start
+            skip_next_continuation = False
+            after_empty_blocks = False
         else:
             stream.extend(payload)
             pos += len(payload)
@@ -261,8 +328,15 @@ def read_dss_file(path):
 
     for fi in range(total_frames):
         if pos in swap_reset_positions:
-            swap = swap_reset_positions[pos]
-            swap_byte = 0
+            swap, reset_swap_byte = swap_reset_positions[pos]
+            if reset_swap_byte:
+                swap_byte = 0
+            if pos in swap_byte_reset_positions:
+                swap_byte = swap_byte_reset_positions[pos]
+            if debug:
+                debug_events.append(
+                    f"packet={fi} stream_pos={pos} reset swap={swap} "
+                    f"reset_swap_byte={reset_swap_byte}")
 
         pkt = bytearray(DSS_SP_FRAME_SIZE + 1)
         if swap:
@@ -283,6 +357,12 @@ def read_dss_file(path):
         pkt[DSS_SP_FRAME_SIZE - 2] = 0
         swap ^= 1
         frame_packets.append(bytes(pkt[:DSS_SP_FRAME_SIZE]))
+
+    if debug:
+        print(f"DSS debug: version={version}, blocks={num_blocks}, "
+              f"declared_frames={total_frames}, packets={len(frame_packets)}")
+        for event in debug_events:
+            print(f"DSS debug: {event}")
 
     return frame_packets, total_frames
 
@@ -346,8 +426,11 @@ class DSSDecoder:
         self.noise_state = 0
         self.pulse_dec_mode = 1
         self.shift_amount = 0
+        # Diagnostic copy of the 12 kHz synthesis samples from the last frame.
+        # This is deliberately captured before the 11:12 output resampler.
+        self.last_internal_samples = []
 
-    def _unpack_coeffs(self, pkt):
+    def _unpack_coeffs(self, pkt, debug=False):
         """Unpack frame bitfields into parameters."""
         reader = BitstreamReader(pkt)
 
@@ -376,20 +459,25 @@ class DSSDecoder:
                 'pulse_pos': [0] * 7,
             })
 
-        # Decode pulse positions using combinatorial table
+        # Decode pulse positions.  ``pulse_dec_mode`` selects how an
+        # out-of-range combined value is handled; it must not gate decoding of
+        # subsequent ordinary values.  Some recorders emit an alternate-form
+        # value at a block crossing.  The old code cleared pulse_dec_mode for
+        # that value and then left every later in-range subframe with seven
+        # pulses at position zero, turning the rest of the recording into
+        # noise.
         for j in range(DSS_SP_SUBFRAMES):
             combined = subframes[j]['combined_pulse_pos']
             if combined < C72_BINOMIALS[7]:
-                if self.pulse_dec_mode:
-                    pulse = 7
-                    pulse_idx = 71
-                    cp = combined
-                    for i in range(7):
-                        while cp < COMBINATORIAL_TABLE[pulse][pulse_idx]:
-                            pulse_idx -= 1
-                        cp -= COMBINATORIAL_TABLE[pulse][pulse_idx]
-                        pulse -= 1
-                        subframes[j]['pulse_pos'][i] = pulse_idx
+                pulse = 7
+                pulse_idx = 71
+                cp = combined
+                for i in range(7):
+                    while cp < COMBINATORIAL_TABLE[pulse][pulse_idx]:
+                        pulse_idx -= 1
+                    cp -= COMBINATORIAL_TABLE[pulse][pulse_idx]
+                    pulse -= 1
+                    subframes[j]['pulse_pos'][i] = pulse_idx
             else:
                 self.pulse_dec_mode = 0
                 c72 = list(C72_BINOMIALS)
@@ -431,6 +519,13 @@ class DSSDecoder:
                     tmp = 36
                 pitch_lag[i] += tmp
             pl = pitch_lag[i]
+
+        if debug:
+            print("DSS trace: unpack "
+                  f"filter={filter_idx} adaptive_gain={sf_adaptive_gain} "
+                  f"pitch={pitch_lag} fixed_gain={[sf['gain'] for sf in subframes]} "
+                  f"pulse_pos={[sf['pulse_pos'] for sf in subframes]} "
+                  f"pulse_mode={self.pulse_dec_mode}")
 
         return filter_idx, sf_adaptive_gain, pitch_lag, subframes
 
@@ -652,10 +747,17 @@ class DSSDecoder:
         # Truncate to 264 samples
         return output[:DSS_SP_SAMPLE_COUNT]
 
-    def decode_frame(self, pkt):
+    def decode_frame(self, pkt, debug=False):
         """Decode one DSS SP frame, returning 264 int16 samples."""
+        if debug:
+            print("DSS trace: state-before "
+                  f"history_abs={sum(abs(x) for x in self.history)} "
+                  f"audio_abs={sum(abs(x) for x in self.audio_buf)} "
+                  f"err1_abs={sum(abs(x) for x in self.err_buf1)} "
+                  f"err2_abs={sum(abs(x) for x in self.err_buf2)} "
+                  f"noise={self.noise_state}")
         filter_idx, sf_adaptive_gain, pitch_lag, subframes = \
-            self._unpack_coeffs(pkt)
+            self._unpack_coeffs(pkt, debug=debug)
 
         self._unpack_filter(filter_idx)
         self._convert_coeffs()
@@ -677,21 +779,57 @@ class DSSDecoder:
         for j in range(DSS_SP_SUBFRAMES):
             working_flat.extend(self.working_buffer[j])
 
+        self.last_internal_samples = working_flat.copy()
+
         # Sinc interpolation resample and produce 264 output samples
         output = self._update_state(working_flat)
+        if debug:
+            print("DSS trace: state-after "
+                  f"history_abs={sum(abs(x) for x in self.history)} "
+                  f"audio_abs={sum(abs(x) for x in self.audio_buf)} "
+                  f"err1_abs={sum(abs(x) for x in self.err_buf1)} "
+                  f"err2_abs={sum(abs(x) for x in self.err_buf2)} "
+                  f"noise={self.noise_state} output=[{min(output)}, {max(output)}]")
         return output
 
-    def decode_file(self, dss_path, wav_path=None):
+    @staticmethod
+    def _frame_stats(samples):
+        """Small, deterministic signal summary useful for locating corruption."""
+        values = np.asarray(samples, dtype=np.float64)
+        if not len(values):
+            return "empty"
+        rms = math.sqrt(float(np.mean(values * values)))
+        peak = int(np.max(np.abs(values)))
+        zcr = int(np.count_nonzero((values[:-1] >= 0) != (values[1:] >= 0)))
+        diff_rms = (math.sqrt(float(np.mean(np.diff(values) ** 2)))
+                    if len(values) > 1 else 0.0)
+        return f"rms={rms:.1f} peak={peak} zc={zcr} diff_rms={diff_rms:.1f}"
+
+    def decode_file(self, dss_path, wav_path=None, max_frames=None, debug=False,
+                    trace_frames=None, stats_frames=None):
         """Decode entire DSS file to samples."""
-        frame_packets, total_frames = read_dss_file(dss_path)
+        frame_packets, total_frames = read_dss_file(dss_path, debug=debug)
+        if max_frames is not None:
+            frame_packets = frame_packets[:max_frames]
 
         all_samples = []
-        for fi in range(total_frames):
-            samples = self.decode_frame(frame_packets[fi])
+        for fi, packet in enumerate(frame_packets):
+            trace = trace_frames is not None and fi in trace_frames
+            if trace:
+                print(f"DSS trace: packet={fi} bytes={packet.hex(' ')}")
+            samples = self.decode_frame(packet, debug=trace)
             all_samples.extend(samples)
+            if stats_frames is not None and fi in stats_frames:
+                print(f"DSS stats: packet={fi} raw12k["
+                      f"{self._frame_stats(self.last_internal_samples)}] out11k["
+                      f"{self._frame_stats(samples)}]")
+            if debug and (fi < 3 or fi % 100 == 0):
+                print(f"DSS debug: decoded packet={fi}, "
+                      f"range=[{min(samples)}, {max(samples)}]")
 
         duration = len(all_samples) / DSS_SP_SAMPLE_RATE
-        print(f"Decoded: {total_frames} frames, {duration:.2f}s at {DSS_SP_SAMPLE_RATE}Hz")
+        print(f"Decoded: {len(frame_packets)}/{total_frames} frames, "
+              f"{duration:.2f}s at {DSS_SP_SAMPLE_RATE}Hz")
 
         samples_16 = np.array(all_samples, dtype=np.int16)
 
@@ -711,15 +849,46 @@ class DSSDecoder:
 # ==============================================================================
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: dss_decode.py <input.DSS> [output.wav]")
-        sys.exit(1)
+    import argparse
 
-    dss_path = sys.argv[1]
-    if len(sys.argv) > 2:
-        wav_path = sys.argv[2]
-    else:
-        wav_path = str(Path(dss_path).with_suffix('.decoded.wav'))
+    parser = argparse.ArgumentParser(description="Decode DSS SP audio to WAV")
+    parser.add_argument("input", help="Input .DSS file")
+    parser.add_argument("output", nargs="?", help="Output .wav path")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print demux and sampled decoder trace output")
+    parser.add_argument("--max-frames", type=int,
+                        help="Decode at most this many frames (for diagnosis)")
+    parser.add_argument("--no-write", action="store_true",
+                        help="Decode without writing a WAV file")
+    parser.add_argument("--trace-frames", metavar="START:END",
+                        help="Trace decoder state and parameters for an inclusive frame range")
+    parser.add_argument("--stats-frames", metavar="START:END",
+                        help="Print raw 12 kHz and output signal statistics for an inclusive frame range")
+    args = parser.parse_args()
+
+    dss_path = args.input
+    wav_path = None if args.no_write else (
+        args.output or str(Path(dss_path).with_suffix('.decoded.wav')))
+    trace_frames = None
+    if args.trace_frames:
+        try:
+            trace_start, trace_end = (int(value) for value in args.trace_frames.split(':', 1))
+        except ValueError:
+            parser.error("--trace-frames must be START:END")
+        if trace_start < 0 or trace_end < trace_start:
+            parser.error("--trace-frames must be a non-negative ascending range")
+        trace_frames = range(trace_start, trace_end + 1)
+    stats_frames = None
+    if args.stats_frames:
+        try:
+            stats_start, stats_end = (int(value) for value in args.stats_frames.split(':', 1))
+        except ValueError:
+            parser.error("--stats-frames must be START:END")
+        if stats_start < 0 or stats_end < stats_start:
+            parser.error("--stats-frames must be a non-negative ascending range")
+        stats_frames = range(stats_start, stats_end + 1)
 
     decoder = DSSDecoder()
-    samples = decoder.decode_file(dss_path, wav_path)
+    samples = decoder.decode_file(
+        dss_path, wav_path, max_frames=args.max_frames, debug=args.debug,
+        trace_frames=trace_frames, stats_frames=stats_frames)
